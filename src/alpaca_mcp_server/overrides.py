@@ -13,6 +13,8 @@ from typing import Optional
 import httpx
 from fastmcp import FastMCP
 
+from .risk_controls import RiskControls
+
 
 def _error(message: str, **extra: object) -> dict:
     """Build a standardised error dict returned to the LLM."""
@@ -21,13 +23,16 @@ def _error(message: str, **extra: object) -> dict:
     return {"error": err}
 
 
-async def _post_order(client: httpx.AsyncClient, body: dict) -> dict:
+async def _post_order(client: httpx.AsyncClient, body: dict, risk: RiskControls, asset_class: str) -> dict:
     """Submit an order and return the response, surfacing API error details.
 
     Catches read-timeouts explicitly because the request may have reached
     Alpaca even though we never received the response.  A generic retry
     would risk placing a duplicate order.
     """
+    blocked = await risk.preflight(client, body, asset_class)
+    if blocked is not None:
+        return _error(blocked["message"])
     try:
         resp = await client.post("/v2/orders", json=body)
     except httpx.ReadTimeout:
@@ -49,7 +54,9 @@ async def _post_order(client: httpx.AsyncClient, body: dict) -> dict:
             http_status=resp.status_code,
             detail=detail,
         )
-    return resp.json()
+    result = resp.json()
+    await risk.record(body, result)
+    return result
 
 
 def register_order_tools(
@@ -57,6 +64,7 @@ def register_order_tools(
     client: httpx.AsyncClient,
 ) -> None:
     """Register the three order placement tools on the given server."""
+    risk = RiskControls()
 
     @server.tool(
         annotations={
@@ -188,7 +196,7 @@ def register_order_tools(
         if advanced_instructions is not None:
             body["advanced_instructions"] = advanced_instructions
 
-        return await _post_order(client, body)
+        return await _post_order(client, body, risk, "stock")
 
     @server.tool(
         annotations={
@@ -244,7 +252,7 @@ def register_order_tools(
         if client_order_id is not None:
             body["client_order_id"] = client_order_id
 
-        return await _post_order(client, body)
+        return await _post_order(client, body, risk, "crypto")
 
     @server.tool(
         annotations={
@@ -338,4 +346,4 @@ def register_order_tools(
         if legs is not None:
             body["legs"] = legs
 
-        return await _post_order(client, body)
+        return await _post_order(client, body, risk, "options")
