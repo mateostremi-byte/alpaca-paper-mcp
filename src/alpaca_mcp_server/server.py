@@ -21,6 +21,7 @@ from fastmcp.server.providers.openapi.routing import MCPType
 
 from .readme_docs import ReadMeClientFactory, register_readme_docs_tools
 from .security import TrustBoundaryMiddleware
+from .trading_gate import require_safe_request
 from .tool_registry import TOOL_DESCRIPTIONS, TOOL_NAMES
 from .toolsets import OVERRIDE_OPERATION_IDS, TOOLSETS, get_active_operations
 
@@ -115,7 +116,9 @@ def _build_auth_headers() -> dict[str, str]:
 
 def _get_trading_base_url() -> str:
     paper = os.environ.get("ALPACA_PAPER_TRADE", "true").lower() in ("true", "1", "yes")
-    return TRADING_API_BASE_URLS["paper" if paper else "live"]
+    if not paper:
+        raise ValueError("This experiment cannot connect to live trading.")
+    return TRADING_API_BASE_URLS["paper"]
 
 
 def _ensure_scheme(url: str) -> str:
@@ -133,7 +136,10 @@ def _parse_toolsets() -> set[str] | None:
 
 
 def _make_api_client(base_url: str, headers: dict[str, str]) -> httpx.AsyncClient:
-    client = httpx.AsyncClient(base_url=base_url, headers=headers, timeout=30.0)
+    client = httpx.AsyncClient(
+        base_url=base_url, headers=headers, timeout=30.0,
+        event_hooks={"request": [require_safe_request]},
+    )
     if "User-Agent" not in headers:
         client.headers.pop("User-Agent", None)
     return client
