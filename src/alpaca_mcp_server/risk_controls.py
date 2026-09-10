@@ -8,7 +8,7 @@ from pathlib import Path
 from typing import Any
 
 class RiskControls:
-    """Fail-closed guardrails for the 200 dollar paper-trading experiment."""
+    """Incomplete draft checks; transport gate must remain locked."""
     def __init__(self) -> None:
         self.capital = Decimal(os.getenv("TRADING_CAPITAL_LIMIT", "200"))
         self.max_position = Decimal(os.getenv("MAX_POSITION_NOTIONAL", "50"))
@@ -21,7 +21,8 @@ class RiskControls:
     @staticmethod
     def dec(value: Any) -> Decimal | None:
         try:
-            return Decimal(str(value))
+            result = Decimal(str(value))
+            return result if result.is_finite() else None
         except (InvalidOperation, TypeError, ValueError):
             return None
 
@@ -30,7 +31,9 @@ class RiskControls:
         response = await client.get("/v2/orders", params={"status": "all", "after": midnight, "direction": "asc", "limit": "500"})
         response.raise_for_status()
         value = response.json()
-        return value if isinstance(value, list) else []
+        if not isinstance(value, list) or len(value) >= 500:
+            raise ValueError("Invalid or potentially truncated order history")
+        return value
 
     async def _exposure(self, client: Any) -> Decimal:
         response = await client.get("/v2/positions")
@@ -54,12 +57,12 @@ class RiskControls:
 
     async def _loss(self, client: Any) -> Decimal:
         response = await client.get("/v2/account/portfolio/history", params={"period": "1D", "timeframe": "1Min", "extended_hours": "true"})
-        if response.is_error:
-            return Decimal("0")
+        response.raise_for_status()
         values = (response.json() or {}).get("profit_loss") or []
         values = [self.dec(value) for value in values]
-        values = [value for value in values if value is not None]
-        return max(Decimal("0"), -values[-1]) if values else Decimal("0")
+        if not values or any(value is None for value in values):
+            raise ValueError("Loss data unavailable or invalid")
+        return max(Decimal("0"), -values[-1])
 
     async def preflight(self, client: Any, body: dict[str, Any], asset_class: str) -> dict[str, Any] | None:
         async with self.lock:
