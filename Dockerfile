@@ -18,5 +18,6 @@ RUN --mount=type=cache,target=/root/.cache/uv \
 
 ENV PATH="/app/.venv/bin:$PATH"
 
-# HTTP transport for remote MCP clients (e.g. ChatGPT). Bind all interfaces; use Render's $PORT via cli default.
-CMD ["alpaca-mcp-server", "--transport", "streamable-http", "--host", "0.0.0.0"]
+# Render entry point adds GitHub authentication plus encrypted persistent OAuth
+# state while preserving the server's paper-trading risk controls.
+CMD ["python", "-m", "alpaca_mcp_server.render_server"]
