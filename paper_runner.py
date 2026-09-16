@@ -10,6 +10,7 @@ from __future__ import annotations
 import json
 import os
 import sys
+import time
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal, ROUND_DOWN, ROUND_UP
@@ -117,6 +118,18 @@ class Alpaca:
         response = self.trading.delete(path)
         if response.status_code not in {200, 204}:
             response.raise_for_status()
+
+
+def wait_for_order_status(api: Alpaca, order_id: str, expected: set[str]) -> dict[str, Any]:
+    last: dict[str, Any] = {}
+    for _ in range(6):
+        last = api.get(f"/v2/orders/{order_id}", {"nested": "true"})
+        if str(last.get("status")) in expected:
+            return last
+        time.sleep(0.5)
+    raise SafetyBlock(
+        f"Order {order_id} did not reach a verified state; last={last.get('status')}"
+    )
 
 
 def emit(status: dict[str, Any]) -> None:
@@ -255,6 +268,7 @@ def cancel_protection_and_exit(api: Alpaca, state: dict[str, Any], now: datetime
         for order in open_orders:
             if order.get("symbol") == symbol and order.get("side") == "sell":
                 api.delete(f"/v2/orders/{order['id']}")
+                wait_for_order_status(api, str(order["id"]), {"canceled", "expired"})
                 actions.append({"action": "cancel_protection", "order_id": order["id"], "symbol": symbol})
         client_id = f"{PREFIX}{now.astimezone(NY):%Y%m%d-%H%M}-{symbol}-exit"
         result = api.post(
@@ -304,6 +318,20 @@ def enter(api: Alpaca, symbol: str, signal: dict[str, Any], state: dict[str, Any
             "client_order_id": client_id,
         },
     )
+    verified = wait_for_order_status(
+        api,
+        str(result.get("id") or ""),
+        {"new", "accepted", "pending_new", "partially_filled", "filled"},
+    )
+    protective_legs = [
+        leg
+        for leg in verified.get("legs") or []
+        if leg.get("side") == "sell" and leg.get("type") in {"stop", "stop_limit"}
+    ]
+    if len(protective_legs) != 1:
+        # The order class was requested atomically. If Alpaca did not return the
+        # child, stop immediately and surface the ambiguous state for review.
+        raise SafetyBlock("Accepted entry lacks one verified protective stop child")
     return {
         "action": "entry_requested",
         "symbol": symbol,
@@ -312,7 +340,8 @@ def enter(api: Alpaca, symbol: str, signal: dict[str, Any], state: dict[str, Any
         "planned_loss": str(planned_loss),
         "client_order_id": client_id,
         "order_id": result.get("id"),
-        "status": result.get("status"),
+        "status": verified.get("status"),
+        "protective_order_id": protective_legs[0].get("id"),
     }
 
 
