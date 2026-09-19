@@ -241,12 +241,14 @@ class AgentTeam:
         technical: dict[str, Any],
         news: list[dict[str, Any]],
         traderank: dict[str, Any],
+        policy: dict[str, Any],
     ) -> dict[str, Any]:
         base = {
             "symbol": symbol,
             "technical": technical,
             "news": news,
             "traderank": traderank,
+            "fixed_policy": policy,
         }
         news_result = self.model.call(
             name="news_agent",
@@ -284,8 +286,10 @@ class AgentTeam:
                 "You are a read-only risk reviewer. Return VETO if sentiment is ADVERSE or "
                 "UNKNOWN, evidence is missing or contradictory, or the bear case identifies an "
                 "unresolved material risk. APPROVE only for a long PAPER entry with confidence "
-                "at least 0.80 and a concrete invalidation price below the supplied ask. You "
-                "cannot waive any deterministic rule and your output does not place an order."
+                "at least 0.80 and a concrete thesis-based invalidation price below the supplied "
+                "ask that fits every fixed policy value. Never move an invalidation closer merely "
+                "to make a trade fit; VETO it instead. You cannot waive any deterministic rule "
+                "and your output does not place an order."
             ),
             evidence=risk_evidence,
             schema=RISK_SCHEMA,

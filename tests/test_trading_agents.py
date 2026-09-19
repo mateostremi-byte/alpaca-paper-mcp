@@ -3,7 +3,7 @@ from decimal import Decimal
 
 import pytest
 
-from trading_agents import AgentError, StructuredModel, agent_gate, json_safe
+from trading_agents import AgentError, AgentTeam, StructuredModel, agent_gate, json_safe
 
 
 def test_json_safe_converts_nested_values():
@@ -63,3 +63,38 @@ def test_agent_gate_blocks_low_confidence_or_invalid_stop():
     )
     assert agent_gate(low_confidence, ask=Decimal("30"))[0] is False
     assert agent_gate(invalid_stop, ask=Decimal("30"))[0] is False
+
+
+class RecordingModel:
+    def __init__(self):
+        self.calls = []
+
+    def call(self, **kwargs):
+        self.calls.append(kwargs)
+        if kwargs["name"] == "news_agent":
+            return {"label": "NEUTRAL", "summary": "none", "factors": []}
+        if kwargs["name"] in {"bull_agent", "bear_agent"}:
+            return {"case": "case", "evidence": [], "confidence": 0.5}
+        return {
+            "verdict": "VETO",
+            "confidence": 0.5,
+            "thesis": "policy mismatch",
+            "invalidation_price": 0,
+            "reasons": ["veto"],
+        }
+
+
+def test_agent_team_supplies_fixed_policy_to_every_stage():
+    model = RecordingModel()
+    AgentTeam(model).analyze(
+        symbol="SCHB",
+        technical={"candidate": "SCHB"},
+        news=[],
+        traderank={"context_only": True},
+        policy={"max_stop_distance_pct": "3.00"},
+    )
+    assert len(model.calls) == 4
+    assert all(
+        call["evidence"]["fixed_policy"]["max_stop_distance_pct"] == "3.00"
+        for call in model.calls
+    )
