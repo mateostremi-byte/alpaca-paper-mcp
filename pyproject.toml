@@ -76,6 +76,7 @@ ignore_missing_imports = true
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+pythonpath = ["."]
 python_files = ["test_*.py"]
 addopts = ["-v", "--tb=short"]
 asyncio_mode = "auto"

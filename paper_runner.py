@@ -19,6 +19,14 @@ from zoneinfo import ZoneInfo
 
 import httpx
 
+from trading_agents import (
+    AgentError,
+    AgentTeam,
+    agent_gate,
+    technical_agent,
+    traderank_context,
+)
+
 NY = ZoneInfo("America/New_York")
 PAPER_BASE = "https://paper-api.alpaca.markets"
 DATA_BASE = "https://data.alpaca.markets"
@@ -110,6 +118,31 @@ class Alpaca:
 
     def data_get(self, path: str, params: dict[str, str] | None = None) -> Any:
         return self._json(self.data.get(path, params=params))
+
+    def news(self, symbol: str, now: datetime) -> list[dict[str, Any]]:
+        payload = self.data_get(
+            "/v1beta1/news",
+            {
+                "symbols": symbol,
+                "start": (now - timedelta(days=2)).isoformat().replace("+00:00", "Z"),
+                "end": now.isoformat().replace("+00:00", "Z"),
+                "sort": "desc",
+                "limit": "10",
+                "include_content": "false",
+            },
+        )
+        output: list[dict[str, Any]] = []
+        for row in payload.get("news") or []:
+            output.append(
+                {
+                    "headline": str(row.get("headline") or "")[:300],
+                    "summary": str(row.get("summary") or "")[:800],
+                    "source": str(row.get("source") or "")[:100],
+                    "created_at": row.get("created_at"),
+                    "url": row.get("url"),
+                }
+            )
+        return output
 
     def post(self, path: str, body: dict[str, Any]) -> Any:
         return self._json(self.trading.post(path, json=body))
@@ -287,7 +320,15 @@ def cancel_protection_and_exit(api: Alpaca, state: dict[str, Any], now: datetime
     return actions
 
 
-def enter(api: Alpaca, symbol: str, signal: dict[str, Any], state: dict[str, Any], policy: Policy, now: datetime) -> dict[str, Any]:
+def enter(
+    api: Alpaca,
+    symbol: str,
+    signal: dict[str, Any],
+    state: dict[str, Any],
+    policy: Policy,
+    now: datetime,
+    invalidation_price: Decimal,
+) -> dict[str, Any]:
     if state["positions"] or state["open_orders"]:
         raise SafetyBlock("An open position or pending order already exists")
     mexp_today = [o for o in state["today_orders"] if str(o.get("client_order_id") or "").startswith(PREFIX)]
@@ -297,7 +338,13 @@ def enter(api: Alpaca, symbol: str, signal: dict[str, Any], state: dict[str, Any
         raise SafetyBlock("Insufficient order slots for entry plus protective child")
 
     limit_price = ceil_cent(signal["ask"] * Decimal("1.001"))
-    stop_price = floor_cent(limit_price * (Decimal("1") - policy.stop_pct))
+    fixed_stop = floor_cent(limit_price * (Decimal("1") - policy.stop_pct))
+    proposed_stop = floor_cent(invalidation_price)
+    minimum_gap = Decimal("0.0025")
+    if proposed_stop <= 0 or proposed_stop >= limit_price * (Decimal("1") - minimum_gap):
+        raise SafetyBlock("Risk-agent invalidation price is not safely below entry")
+    # The model may tighten protection but can never widen the fixed 3% stop.
+    stop_price = max(fixed_stop, proposed_stop)
     planned_loss = limit_price - stop_price
     if limit_price > policy.max_position or planned_loss > policy.max_risk:
         raise SafetyBlock("Entry sizing or planned loss exceeds policy")
@@ -380,11 +427,41 @@ def run() -> int:
             else:
                 signals = bars_and_quotes(api, now)
                 report["signals"] = signals
-                qualified = [(symbol, value) for symbol, value in signals.items() if value["qualifies"]]
-                qualified.sort(key=lambda item: (item[1]["session_return"], -UNIVERSE.index(item[0])), reverse=True)
-                if qualified:
-                    report["order"] = enter(api, qualified[0][0], qualified[0][1], state, policy, now)
-                    report["action"] = "entry_requested"
+                technical = technical_agent(signals)
+                report["technical_agent"] = technical
+                candidate = technical["candidate"]
+                if candidate:
+                    context = traderank_context()
+                    news = api.news(candidate, now)
+                    agents = AgentTeam.from_environment().analyze(
+                        symbol=candidate,
+                        technical=technical,
+                        news=news,
+                        traderank=context,
+                    )
+                    report["traderank_agent"] = context
+                    report["agents"] = agents
+                    risk = agents["risk"]
+                    approved, gate_reason = agent_gate(
+                        agents, ask=signals[candidate]["ask"]
+                    )
+                    report["agent_gate"] = {
+                        "approved": approved,
+                        "reason": gate_reason,
+                    }
+                    if not approved:
+                        report["action"] = "risk_veto"
+                    else:
+                        report["order"] = enter(
+                            api,
+                            candidate,
+                            signals[candidate],
+                            state,
+                            policy,
+                            now,
+                            Decimal(str(risk["invalidation_price"])),
+                        )
+                        report["action"] = "entry_requested"
                 else:
                     report["action"] = "no_signal"
         elif not state["clock"].get("is_open"):
@@ -397,6 +474,11 @@ def run() -> int:
         return 0
     except SafetyBlock as exc:
         report["action"] = "safety_block"
+        report["error"] = str(exc)
+        emit(report)
+        return 0
+    except AgentError as exc:
+        report["action"] = "agent_veto"
         report["error"] = str(exc)
         emit(report)
         return 0
