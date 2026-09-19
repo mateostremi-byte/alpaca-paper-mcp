@@ -11,6 +11,7 @@ RUN --mount=type=cache,target=/root/.cache/uv \
 
 COPY pyproject.toml uv.lock README.md ./
 COPY src/ ./src/
+COPY paper_runner.py trading_agents.py ./
 
 RUN --mount=type=cache,target=/root/.cache/uv \
     uv sync --frozen
