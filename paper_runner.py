@@ -73,6 +73,42 @@ def sma(values: list[Decimal], length: int = 20) -> Decimal:
     return sum(values[-length:]) / Decimal(length)
 
 
+def parse_timestamp(value: str) -> datetime:
+    return datetime.fromisoformat(value.replace("Z", "+00:00"))
+
+
+def regular_session_bar(row: dict[str, Any]) -> bool:
+    local = parse_timestamp(str(row["t"])).astimezone(NY)
+    return (local.hour, local.minute) >= (9, 30) and (local.hour, local.minute) < (16, 0)
+
+
+def completed_bars(
+    rows: list[dict[str, Any]], now: datetime, duration: timedelta
+) -> list[dict[str, Any]]:
+    """Return regular-session bars whose full interval has elapsed."""
+    return [
+        row
+        for row in rows
+        if regular_session_bar(row) and parse_timestamp(str(row["t"])) + duration <= now
+    ]
+
+
+def trend_metrics(rows: list[dict[str, Any]], label: str) -> dict[str, Any]:
+    if len(rows) < 21:
+        raise SafetyBlock(f"Insufficient completed {label} bars")
+    closes = [money(row["c"]) for row in rows]
+    current_sma = sma(closes[-20:])
+    prior_sma = sma(closes[-21:-1])
+    close = closes[-1]
+    return {
+        "close": close,
+        "sma20": current_sma,
+        "prior_sma20": prior_sma,
+        "bar_time": rows[-1]["t"],
+        "bullish": close > current_sma and current_sma > prior_sma,
+    }
+
+
 def is_scan_time(now: datetime) -> bool:
     local = now.astimezone(NY)
     return (local.hour == 9 and local.minute == 45) or local.minute in {0, 30}
@@ -227,17 +263,31 @@ def preflight(api: Alpaca, policy: Policy, now: datetime) -> dict[str, Any]:
 
 
 def bars_and_quotes(api: Alpaca, now: datetime) -> dict[str, dict[str, Any]]:
-    start = (now - timedelta(days=7)).isoformat().replace("+00:00", "Z")
+    five_minute_start = (now - timedelta(days=7)).isoformat().replace("+00:00", "Z")
+    hourly_start = (now - timedelta(days=45)).isoformat().replace("+00:00", "Z")
     end = now.isoformat().replace("+00:00", "Z")
     symbols = ",".join(UNIVERSE)
-    bars_payload = api.data_get(
+    five_minute_payload = api.data_get(
         "/v2/stocks/bars",
         {
             "symbols": symbols,
             "timeframe": "5Min",
-            "start": start,
+            "start": five_minute_start,
             "end": end,
-            "limit": "1000",
+            "limit": "10000",
+            "adjustment": "raw",
+            "feed": "iex",
+            "sort": "asc",
+        },
+    )
+    hourly_payload = api.data_get(
+        "/v2/stocks/bars",
+        {
+            "symbols": symbols,
+            "timeframe": "1Hour",
+            "start": hourly_start,
+            "end": end,
+            "limit": "10000",
             "adjustment": "raw",
             "feed": "iex",
             "sort": "asc",
@@ -246,24 +296,30 @@ def bars_and_quotes(api: Alpaca, now: datetime) -> dict[str, dict[str, Any]]:
     quote_payload = api.data_get(
         "/v2/stocks/quotes/latest", {"symbols": symbols, "feed": "iex"}
     )
-    all_bars = bars_payload.get("bars") or {}
+    all_five_minute_bars = five_minute_payload.get("bars") or {}
+    all_hourly_bars = hourly_payload.get("bars") or {}
     quotes = quote_payload.get("quotes") or {}
     output: dict[str, dict[str, Any]] = {}
 
     for symbol in UNIVERSE:
-        rows = all_bars.get(symbol) or []
-        completed = [row for row in rows if datetime.fromisoformat(row["t"].replace("Z", "+00:00")) < now]
-        if len(completed) < 21:
-            raise SafetyBlock(f"Insufficient completed bars for {symbol}")
-        closes = [money(row["c"]) for row in completed]
-        current_sma = sma(closes[-20:])
-        prior_sma = sma(closes[-21:-1])
+        five_minute_rows = completed_bars(
+            all_five_minute_bars.get(symbol) or [], now, timedelta(minutes=5)
+        )
+        hourly_rows = completed_bars(
+            all_hourly_bars.get(symbol) or [], now, timedelta(hours=1)
+        )
+        five_minute = trend_metrics(five_minute_rows, f"5-minute bars for {symbol}")
+        hourly = trend_metrics(hourly_rows, f"hourly bars for {symbol}")
         local_day = now.astimezone(NY).date()
-        session = [row for row in completed if datetime.fromisoformat(row["t"].replace("Z", "+00:00")).astimezone(NY).date() == local_day]
+        session = [
+            row
+            for row in five_minute_rows
+            if parse_timestamp(str(row["t"])).astimezone(NY).date() == local_day
+        ]
         if not session:
             raise SafetyBlock(f"No completed current-session bars for {symbol}")
         session_open = money(session[0]["o"])
-        close = closes[-1]
+        close = five_minute["close"]
         quote = quotes.get(symbol) or {}
         bid, ask = money(quote.get("bp")), money(quote.get("ap"))
         if bid <= 0 or ask <= 0 or ask < bid:
@@ -271,18 +327,21 @@ def bars_and_quotes(api: Alpaca, now: datetime) -> dict[str, dict[str, Any]]:
         midpoint = (bid + ask) / Decimal("2")
         spread_bps = ((ask - bid) / midpoint) * Decimal("10000")
         session_return = (close / session_open) - Decimal("1")
+        timeframes_agree = bool(hourly["bullish"] and five_minute["bullish"])
         output[symbol] = {
             "close": close,
-            "sma20": current_sma,
-            "prior_sma20": prior_sma,
+            "sma20": five_minute["sma20"],
+            "prior_sma20": five_minute["prior_sma20"],
             "session_open": session_open,
             "session_return": session_return,
             "bid": bid,
             "ask": ask,
             "spread_bps": spread_bps,
-            "bar_time": completed[-1]["t"],
-            "qualifies": close > current_sma
-            and current_sma > prior_sma
+            "bar_time": five_minute["bar_time"],
+            "five_minute_trend": five_minute,
+            "hourly_trend": hourly,
+            "timeframes_agree": timeframes_agree,
+            "qualifies": timeframes_agree
             and session_return > 0
             and ask <= Decimal("50")
             and spread_bps <= Decimal("10"),
@@ -343,8 +402,10 @@ def enter(
     minimum_gap = Decimal("0.0025")
     if proposed_stop <= 0 or proposed_stop >= limit_price * (Decimal("1") - minimum_gap):
         raise SafetyBlock("Risk-agent invalidation price is not safely below entry")
-    # The model may tighten protection but can never widen the fixed 3% stop.
-    stop_price = max(fixed_stop, proposed_stop)
+    if proposed_stop < fixed_stop:
+        raise SafetyBlock("Thesis invalidation requires a stop wider than policy permits")
+    # Preserve the thesis-derived invalidation exactly; never move it merely to fit policy.
+    stop_price = proposed_stop
     planned_loss = limit_price - stop_price
     if limit_price > policy.max_position or planned_loss > policy.max_risk:
         raise SafetyBlock("Entry sizing or planned loss exceeds policy")
@@ -438,6 +499,15 @@ def run() -> int:
                         technical=technical,
                         news=news,
                         traderank=context,
+                        policy={
+                            "side": "long",
+                            "quantity": "1 whole share",
+                            "experiment_capital": str(policy.capital),
+                            "max_position_dollars": str(policy.max_position),
+                            "max_planned_loss_dollars": str(policy.max_risk),
+                            "max_stop_distance_pct": str(policy.stop_pct * Decimal("100")),
+                            "atomic_protective_stop_required": True,
+                        },
                     )
                     report["traderank_agent"] = context
                     report["agents"] = agents
